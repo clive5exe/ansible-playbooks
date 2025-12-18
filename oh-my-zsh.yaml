@@ -1,0 +1,214 @@
+---
+- name: Unify Zsh + Oh-My-Zsh + Powerlevel10k across Rocky + Ubuntu (clone from r9-ctrl)
+  hosts: all:!rhcsa
+  become: true
+  gather_facts: true
+
+  vars:
+    target_user: ghost
+    target_home: "/home/{{ target_user }}"
+    controller_host: r9-ctrl
+
+    # Dotfiles to clone exactly from controller user's home
+    dotfiles:
+      - .zshrc
+      - .p10k.zsh
+
+    # Optional files (won't fail if missing on controller)
+    optional_dotfiles:
+      - .zprofile
+      - .zshenv
+      - .zlogin
+
+    omz_dir: "{{ target_home }}/.oh-my-zsh"
+    omz_sh: "{{ omz_dir }}/oh-my-zsh.sh"
+    p10k_dir: "{{ omz_dir }}/custom/themes/powerlevel10k"
+
+  pre_tasks:
+    - name: Sanity - ensure target user exists
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        state: present
+        create_home: true
+        shell: /bin/zsh
+
+    - name: Install base packages (Debian/Ubuntu)
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - zsh
+          - git
+          - curl
+          - rsync
+          - fontconfig
+        state: present
+      when: ansible_facts.os_family == "Debian"
+
+    - name: Install base packages (Rocky/RHEL)
+      ansible.builtin.dnf:
+        name:
+          - zsh
+          - git
+          - curl
+          - rsync
+          - fontconfig
+        state: present
+      when: ansible_facts.os_family == "RedHat"
+
+  tasks:
+    # ---- Fix broken OMZ state (folder exists but missing main script) ----
+    - name: Check OMZ main script presence
+      ansible.builtin.stat:
+        path: "{{ omz_sh }}"
+      register: omz_stat
+      become_user: "{{ target_user }}"
+
+    - name: If OMZ folder exists but script missing, wipe it (repair)
+      ansible.builtin.file:
+        path: "{{ omz_dir }}"
+        state: absent
+      when: (omz_stat.stat.exists == false) and (omz_dir is defined)
+      # only remove if directory exists
+      # (stat for dir)
+      vars:
+        _noop: true
+
+    - name: Check OMZ dir exists
+      ansible.builtin.stat:
+        path: "{{ omz_dir }}"
+      register: omz_dir_stat
+      become_user: "{{ target_user }}"
+
+    - name: Install Oh-My-Zsh (git clone, idempotent)
+      ansible.builtin.git:
+        repo: "https://github.com/ohmyzsh/ohmyzsh.git"
+        dest: "{{ omz_dir }}"
+        version: master
+        update: true
+      become_user: "{{ target_user }}"
+      when: not omz_dir_stat.stat.exists
+
+    # ---- Powerlevel10k ----
+    - name: Install Powerlevel10k (git clone)
+      ansible.builtin.git:
+        repo: "https://github.com/romkatv/powerlevel10k.git"
+        dest: "{{ p10k_dir }}"
+        version: master
+        update: true
+      become_user: "{{ target_user }}"
+
+    # ---- Pull controller dotfiles ONCE (to local tmp on controller), then copy to targets ----
+    - name: Create local staging dir on controller
+      ansible.builtin.file:
+        path: "/tmp/zshclone_{{ target_user }}"
+        state: directory
+        mode: "0755"
+      delegate_to: "{{ controller_host }}"
+      run_once: true
+
+    - name: Stage required dotfiles from controller
+      ansible.builtin.copy:
+        src: "{{ target_home }}/{{ item }}"
+        dest: "/tmp/zshclone_{{ target_user }}/{{ item }}"
+        remote_src: true
+        mode: "0644"
+      loop: "{{ dotfiles }}"
+      delegate_to: "{{ controller_host }}"
+      run_once: true
+      become_user: "{{ target_user }}"
+
+    - name: Stage optional dotfiles from controller (if they exist)
+      ansible.builtin.stat:
+        path: "{{ target_home }}/{{ item }}"
+      loop: "{{ optional_dotfiles }}"
+      delegate_to: "{{ controller_host }}"
+      run_once: true
+      register: opt_stats
+      become_user: "{{ target_user }}"
+
+    - name: Copy optional dotfiles into staging (only when present)
+      ansible.builtin.copy:
+        src: "{{ target_home }}/{{ item.item }}"
+        dest: "/tmp/zshclone_{{ target_user }}/{{ item.item }}"
+        remote_src: true
+        mode: "0644"
+      loop: "{{ opt_stats.results }}"
+      when: item.stat.exists
+      delegate_to: "{{ controller_host }}"
+      run_once: true
+      become_user: "{{ target_user }}"
+
+    - name: Copy staged required dotfiles to target
+      ansible.builtin.copy:
+        src: "/tmp/zshclone_{{ target_user }}/{{ item }}"
+        dest: "{{ target_home }}/{{ item }}"
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0644"
+      loop: "{{ dotfiles }}"
+
+    - name: Copy staged optional dotfiles to target if staged
+      ansible.builtin.stat:
+        path: "/tmp/zshclone_{{ target_user }}/{{ item }}"
+      loop: "{{ optional_dotfiles }}"
+      delegate_to: "{{ controller_host }}"
+      run_once: true
+      register: staged_opts
+
+    - name: Copy staged optional dotfiles to target
+      ansible.builtin.copy:
+        src: "/tmp/zshclone_{{ target_user }}/{{ item.item }}"
+        dest: "{{ target_home }}/{{ item.item }}"
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0644"
+      loop: "{{ staged_opts.results }}"
+      when: item.stat.exists
+
+    # ---- Ensure .zshrc points to OMZ and p10k (so no missing oh-my-zsh.sh) ----
+    - name: Ensure ZSH env var is set in .zshrc
+      ansible.builtin.lineinfile:
+        path: "{{ target_home }}/.zshrc"
+        regexp: '^export ZSH='
+        line: 'export ZSH="{{ omz_dir }}"'
+        create: true
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0644"
+
+    - name: Ensure OMZ loads in .zshrc
+      ansible.builtin.lineinfile:
+        path: "{{ target_home }}/.zshrc"
+        regexp: 'oh-my-zsh\.sh'
+        line: 'source "$ZSH/oh-my-zsh.sh"'
+        insertafter: '^export ZSH='
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0644"
+
+    - name: Ensure p10k loads in .zshrc
+      ansible.builtin.lineinfile:
+        path: "{{ target_home }}/.zshrc"
+        regexp: 'source ~\/\.p10k\.zsh'
+        line: '[[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh'
+        insertafter: 'oh-my-zsh\.sh'
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: "0644"
+
+    - name: Set default shell to zsh for user
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        shell: /bin/zsh
+
+  post_tasks:
+    - name: Quick verification (no fail) - show shell + key files
+      ansible.builtin.shell: |
+        set -e
+        echo "HOST=$(hostname)"
+        echo "SHELL=$SHELL"
+        test -f "{{ omz_sh }}" && echo "OMZ=OK" || echo "OMZ=MISSING"
+        test -f "{{ target_home }}/.p10k.zsh" && echo "P10KCFG=OK" || echo "P10KCFG=MISSING"
+      args:
+        executable: /bin/bash
+      changed_when: false

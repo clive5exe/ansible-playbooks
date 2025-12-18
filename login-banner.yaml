@@ -1,0 +1,56 @@
+---
+- name: Install figlet and set ASCII login banner
+  hosts: all_linux
+  become: true
+  gather_facts: yes
+
+  tasks:
+    # --- RHEL / Rocky specific prep ---
+    - name: Ensure EPEL repo installed on RHEL 9
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version is version('9', '==')
+
+    # --- Install figlet on all distros ---
+    - name: Install figlet
+      ansible.builtin.package:
+        name: figlet
+        state: present
+
+    # --- Remove any old banner scripts so we don't get double figlet ---
+    - name: Remove old banner scripts (avoid duplicate banners)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/profile.d/login-banner.sh
+        - /etc/profile.d/host-banner.sh
+
+    # --- Install the new, single source of truth banner script ---
+    - name: Create banner script in /etc/profile.d
+      ansible.builtin.copy:
+        dest: /etc/profile.d/host-banner.sh
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          # Show host banner once for interactive SSH sessions
+
+          # Only in interactive shells
+          case "$-" in *i*) ;; *) return ;; esac
+
+          # Only for SSH sessions
+          if [ -z "${SSH_TTY:-}${SSH_CONNECTION:-}" ]; then
+            return
+          fi
+
+          if command -v figlet >/dev/null 2>&1; then
+            echo
+            figlet -w 120 "$(hostname -s)"
+            uname -srmo
+            echo
+          fi

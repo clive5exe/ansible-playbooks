@@ -1,0 +1,123 @@
+---
+- name: Native code-server on r9-node2 (no container)
+  hosts: r9-node2
+  become: true
+  vars:
+    cs_port: 8443
+    cs_user: ghost
+    cs_group: ghost
+    cs_pwd: "november18th"
+    cs_data_dir: /srv/dev/data/code
+    cs_cfg_dir: /etc/code-server
+
+  pre_tasks:
+    - name: Stop & disable leftover containerized code-server (ignore if missing)
+      ansible.builtin.systemd:
+        name: container-code-server.service
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove any lingering code-server containers (docker/podman)
+      ansible.builtin.shell: |
+        docker rm -f code-server 2>/dev/null || true
+        podman rm -f code-server 2>/dev/null || true
+
+  tasks:
+    - name: Ensure base tools
+      ansible.builtin.dnf:
+        name: [curl, tar]
+        state: present
+
+    - name: Create data dirs (extensions & user-data)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ cs_user }}"
+        group: "{{ cs_group }}"
+        mode: "0755"
+      loop:
+        - "{{ cs_data_dir }}"
+        - "{{ cs_data_dir }}/extensions"
+        - "{{ cs_data_dir }}/user-data"
+
+    - name: Fetch official installer
+      ansible.builtin.get_url:
+        url: https://code-server.dev/install.sh
+        dest: /tmp/code-server-install.sh
+        mode: "0755"
+
+    - name: Install/upgrade code-server
+      ansible.builtin.command: bash /tmp/code-server-install.sh
+      args:
+        creates: /usr/bin/code-server
+
+    - name: Ensure config dir
+      ansible.builtin.file:
+        path: "{{ cs_cfg_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write code-server config
+      ansible.builtin.copy:
+        dest: "{{ cs_cfg_dir }}/config.yaml"
+        mode: "0600"
+        owner: "{{ cs_user }}"
+        group: "{{ cs_group }}"
+        content: |
+          bind-addr: 0.0.0.0:{{ cs_port }}
+          auth: password
+          password: {{ cs_pwd }}
+          cert: false
+          user-data-dir: {{ cs_data_dir }}/user-data
+          extensions-dir: {{ cs_data_dir }}/extensions
+          disable-telemetry: true
+
+    - name: Create systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/code-server.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=code-server (VS Code in the browser) - native
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ cs_user }}
+          Group={{ cs_group }}
+          ExecStart=/usr/bin/code-server --config {{ cs_cfg_dir }}/config.yaml
+          Restart=on-failure
+          RestartSec=3
+          NoNewPrivileges=true
+          ProtectSystem=full
+          ProtectHome=false
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Open firewalld port {{ cs_port }}/tcp on default zone
+      ansible.builtin.shell: |
+        zone=$(firewall-cmd --get-default-zone)
+        firewall-cmd --permanent --zone="$zone" --add-port={{ cs_port }}/tcp || true
+        firewall-cmd --reload || true
+
+    - name: Enable & start native code-server
+      ansible.builtin.systemd:
+        name: code-server
+        state: started
+        enabled: true
+
+  post_tasks:
+    - name: Probe localhost
+      ansible.builtin.shell: "curl -sI http://127.0.0.1:{{ cs_port }} | head -1 || true"
+      register: probe
+
+    - name: Show probe
+      ansible.builtin.debug:
+        msg: "{{ probe.stdout }}"

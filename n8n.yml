@@ -1,0 +1,31 @@
+- name: n8n on r9-node2
+  hosts: r9-node2
+  become: true
+  vars:
+    n8n_port: 5678
+    n8n_dir: /srv/n8n
+    n8n_user: ghost
+    n8n_pass: change-me   # set a better one later
+  tasks:
+    - name: Ensure data dir exists (UID 1000 inside container)
+      file:
+        path: "{{ n8n_dir }}"
+        state: directory
+        owner: 1000
+        group: 1000
+        mode: "0755"
+
+    - name: Run n8n container (replace if exists)
+      ansible.builtin.shell: >
+        podman run -d --name n8n --replace --restart=always
+        -p {{ n8n_port }}:5678
+        -v {{ n8n_dir }}:/home/node/.n8n:Z
+        -e N8N_BASIC_AUTH_ACTIVE=true
+        -e N8N_BASIC_AUTH_USER={{ n8n_user }}
+        -e N8N_BASIC_AUTH_PASSWORD='{{ n8n_pass }}'
+        docker.io/n8nio/n8n:latest
+
+    - name: Open firewall {{ n8n_port }}/tcp (permanent) and reload
+      ansible.builtin.shell: |
+        firewall-cmd --permanent --add-port={{ n8n_port }}/tcp
+        firewall-cmd --reload

@@ -1,0 +1,16 @@
+---
+- name: REMOVE Promtail Agent and Configuration
+  hosts: all_linux
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Stop and remove Promtail container
+      ansible.builtin.shell:
+        cmd: "podman stop promtail; podman rm -f promtail"
+      ignore_errors: true
+
+    - name: Remove Promtail configuration directory
+      ansible.builtin.file:
+        path: /etc/promtail
+        state: absent

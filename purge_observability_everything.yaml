@@ -1,0 +1,152 @@
+---
+- name: PURGE - remove node_exporter + loki/promtail + related files (everything we added)
+  hosts: all_linux
+  become: true
+  gather_facts: true
+
+  vars:
+    quadlet_dir_candidates:
+      - /etc/containers/systemd
+      - /usr/share/containers/systemd
+
+    # Promtail / Loki paths we used
+    promtail_root: /srv/containers/promtail
+    loki_root: /srv/containers/loki
+
+    # Node exporter common install locations (covers "binary + systemd" installs)
+    node_exporter_bin_candidates:
+      - /usr/local/bin/node_exporter
+      - /usr/bin/node_exporter
+
+    node_exporter_service_candidates:
+      - node_exporter.service
+      - prometheus-node-exporter.service
+      - container-node-exporter.service
+      - node-exporter.service
+
+    # If we created any file_sd targets on Prometheus host, remove it too (handled below on r9-ctrl)
+    file_sd_targets_candidates:
+      - /srv/containers/prometheus/file_sd/node_exporter_targets.yml
+      - /srv/containers/prometheus/file_sd/node_exporter_targets.yaml
+      - /srv/gitlab/data/prometheus/file_sd/node_exporter_targets.yml
+      - /srv/gitlab/data/prometheus/file_sd/node_exporter_targets.yaml
+
+  tasks:
+    - name: Stop/disable promtail/loki/node_exporter services if present
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - promtail
+        - loki
+        - node_exporter
+        - prometheus-node-exporter
+        - container-promtail
+        - container-loki
+        - container-node-exporter
+        - node-exporter
+      ignore_errors: true
+
+    - name: Stop and remove podman containers if present
+      ansible.builtin.shell: |
+        set -e
+        if command -v podman >/dev/null 2>&1; then
+          podman rm -f promtail >/dev/null 2>&1 || true
+          podman rm -f loki >/dev/null 2>&1 || true
+          podman rm -f node-exporter >/dev/null 2>&1 || true
+          podman rm -f node_exporter >/dev/null 2>&1 || true
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Remove quadlet files (promtail/loki/node-exporter) from /etc/containers/systemd (if present)
+      ansible.builtin.file:
+        path: "{{ item.0 }}/{{ item.1 }}"
+        state: absent
+      loop: "{{ quadlet_dir_candidates | product(['promtail.container','loki.container','node-exporter.container','node_exporter.container']) | list }}"
+      ignore_errors: true
+
+    - name: Reset systemd failures + reload
+      ansible.builtin.shell: |
+        set -e
+        systemctl daemon-reload || true
+        systemctl reset-failed || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # --- Remove promtail/loki config dirs we created ---
+    - name: Remove promtail and loki container directories we created
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ promtail_root }}"
+        - "{{ loki_root }}"
+      ignore_errors: true
+
+    # --- Remove node_exporter installs (binary + user + service) ---
+    - name: Remove node_exporter systemd unit files if present
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/node_exporter.service
+        - /etc/systemd/system/prometheus-node-exporter.service
+        - /usr/lib/systemd/system/node_exporter.service
+        - /usr/lib/systemd/system/prometheus-node-exporter.service
+      ignore_errors: true
+
+    - name: Remove node_exporter binary if present
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ node_exporter_bin_candidates }}"
+      ignore_errors: true
+
+    - name: Remove node_exporter user/group if present
+      ansible.builtin.user:
+        name: node_exporter
+        state: absent
+        remove: true
+      ignore_errors: true
+
+    - name: Remove common node_exporter dirs if present
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/node_exporter
+        - /var/lib/node_exporter
+        - /opt/node_exporter
+      ignore_errors: true
+
+- name: PURGE - remove Prometheus file_sd targets we created (r9-ctrl only)
+  hosts: r9-ctrl
+  become: true
+  gather_facts: false
+
+  vars:
+    file_sd_targets_candidates:
+      - /srv/containers/prometheus/file_sd/node_exporter_targets.yml
+      - /srv/containers/prometheus/file_sd/node_exporter_targets.yaml
+      - /srv/gitlab/data/prometheus/file_sd/node_exporter_targets.yml
+      - /srv/gitlab/data/prometheus/file_sd/node_exporter_targets.yaml
+
+  tasks:
+    - name: Remove node_exporter file_sd targets files (if any)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ file_sd_targets_candidates }}"
+      ignore_errors: true
+
+    - name: Reload systemd (safe)
+      ansible.builtin.shell: |
+        systemctl daemon-reload || true
+        systemctl reset-failed || true
+      args:
+        executable: /bin/bash
+      changed_when: false

@@ -1,0 +1,35 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  # This uses Ansible to dynamically look up the IP of your r9-ctrl host for Loki.
+  - url: http://{{ hostvars['r9-ctrl']['ansible_host'] }}:3100/loki/api/v1/push
+
+scrape_configs:
+# Job to ship standard system logs (/var/log/messages, /var/log/syslog, etc.)
+- job_name: system
+  static_configs:
+  - targets:
+      - localhost
+    labels:
+      job: system
+      host: {{ ansible_hostname }}
+      role: {{ promtail_role | default('general') }}
+      __path__: /var/log/*log
+
+# Job to ship journalctl logs (for container output and systemd services)
+- job_name: journal
+  journal:
+    max_age: 12h
+    path: /var/log/journal
+  relabel_configs:
+    - source_labels: [__journal__systemd_unit]
+      target_label: unit
+    - source_labels: [__tenant_id__]
+      target_label: tenant
+    - source_labels: [__host__]
+      target_label: host

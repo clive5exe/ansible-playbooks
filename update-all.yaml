@@ -1,0 +1,28 @@
+# update-all.yaml
+---
+- name: Update all Linux hosts
+  hosts: all_linux
+  become: true
+  gather_facts: yes
+
+  tasks:
+    - name: Update packages on RedHat family (dnf)
+      dnf:
+        name: "*"
+        state: latest
+      when: ansible_os_family == "RedHat"
+
+    - name: Run distro-sync on RHEL 9 (optional but nice)
+      dnf:
+        name: "*"
+        state: latest
+        allow_downgrade: true
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version is version('9', '==')
+
+    - name: Update packages on Debian/Ubuntu (apt)
+      apt:
+        update_cache: yes
+        upgrade: dist
+      when: ansible_os_family == "Debian"

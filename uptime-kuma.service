@@ -1,0 +1,21 @@
+[Unit]
+Description=Uptime Kuma (Podman)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Restart=always
+TimeoutStopSec=30
+ExecStartPre=-/usr/bin/podman stop uptime-kuma
+ExecStartPre=-/usr/bin/podman rm uptime-kuma
+ExecStartPre=/usr/bin/podman pull docker.io/louislam/uptime-kuma:latest
+ExecStart=/usr/bin/podman run --name uptime-kuma \
+  -p 3001:3001 \
+  -v /srv/kuma:/app/data:Z \
+  --log-driver=journald \
+  docker.io/louislam/uptime-kuma:latest
+ExecStop=/usr/bin/podman stop -t 10 uptime-kuma
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

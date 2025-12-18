@@ -1,0 +1,126 @@
+---
+- name: NUKE observability stack (Loki/Promtail + our Prometheus edits) - clean rollback
+  hosts: all_linux
+  become: true
+  gather_facts: false
+
+  vars:
+    # Quadlet locations (system-wide)
+    quadlet_dir: /etc/containers/systemd
+
+    # Stuff we created for Loki/Promtail
+    promtail_root: /srv/containers/promtail
+    loki_root: /srv/containers/loki
+
+  tasks:
+    - name: Stop + disable promtail/loki services if they exist (Quadlet-generated)
+      ansible.builtin.shell: |
+        set +e
+        systemctl stop promtail.service 2>/dev/null || true
+        systemctl disable promtail.service 2>/dev/null || true
+        systemctl stop loki.service 2>/dev/null || true
+        systemctl disable loki.service 2>/dev/null || true
+        systemctl reset-failed promtail.service loki.service 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: Remove old BAD generated units if they exist (container-*.service)
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item }}"
+        state: absent
+      loop:
+        - container-promtail.service
+        - container-loki.service
+
+    - name: Remove Quadlet unit files (promtail/loki)
+      ansible.builtin.file:
+        path: "{{ quadlet_dir }}/{{ item }}"
+        state: absent
+      loop:
+        - promtail.container
+        - loki.container
+
+    - name: Remove Loki/Promtail container data + configs under /srv/containers
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ promtail_root }}"
+        - "{{ loki_root }}"
+
+    - name: Remove running containers if they exist (podman)
+      ansible.builtin.shell: |
+        set +e
+        command -v podman >/dev/null 2>&1 || exit 0
+        podman rm -f promtail 2>/dev/null || true
+        podman rm -f loki 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: systemd reload
+      ansible.builtin.shell: |
+        systemctl daemon-reload
+        systemctl reset-failed 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+- name: Revert Prometheus changes on r9-ctrl (remove managed block + file_sd we added)
+  hosts: r9-ctrl
+  become: true
+  gather_facts: false
+
+  vars:
+    prom_cfg: /srv/gitlab/data/prometheus/prometheus.yml
+    filesd_dir: /srv/gitlab/data/prometheus/file_sd
+    node_sd_file: /srv/gitlab/data/prometheus/file_sd/node_exporter.yml
+
+  tasks:
+    - name: Backup prometheus.yml if it exists
+      ansible.builtin.shell: |
+        set -e
+        if [ -f "{{ prom_cfg }}" ]; then
+          cp -a "{{ prom_cfg }}" "{{ prom_cfg }}.bak.$(date +%Y%m%d-%H%M%S)"
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Remove ANSIBLE managed node exporter scrape block (if present)
+      ansible.builtin.blockinfile:
+        path: "{{ prom_cfg }}"
+        marker: "# {mark} ANSIBLE_MANAGED_NODE_EXPORTER"
+        block: ""
+        state: absent
+      when: prom_cfg is defined
+
+    - name: Remove file_sd targets file we created
+      ansible.builtin.file:
+        path: "{{ node_sd_file }}"
+        state: absent
+
+    - name: Remove file_sd directory if empty (leave it if GitLab uses it for something else)
+      ansible.builtin.shell: |
+        set -e
+        if [ -d "{{ filesd_dir }}" ]; then
+          rmdir "{{ filesd_dir }}" 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Restart Prometheus (best-effort)
+      ansible.builtin.shell: |
+        set +e
+        if command -v podman >/dev/null 2>&1 && podman ps --format '{{"{{"}}.Names{{"}}"}}' | grep -qx prometheus; then
+          podman restart prometheus
+          exit 0
+        fi
+        if command -v gitlab-ctl >/dev/null 2>&1; then
+          gitlab-ctl restart prometheus || true
+          exit 0
+        fi
+        if systemctl list-units --all | grep -q '^prometheus\.service'; then
+          systemctl restart prometheus || true
+          exit 0
+        fi
+        exit 0
+      args:
+        executable: /bin/bash

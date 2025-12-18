@@ -1,0 +1,63 @@
+---
+- name: code-server on r9-node2 (Podman + systemd)
+  hosts: r9-node2
+  become: true
+  vars:
+    code_port: 8443
+    code_pass: "devbox123"      # change this
+    tz: "America/New_York"
+    puid: "1000"
+    pgid: "1000"
+  tasks:
+    - name: Ensure data dir exists
+      file:
+        path: /srv/code
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create systemd unit for code-server (Podman)
+      copy:
+        dest: /etc/systemd/system/code-server.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=code-server (Podman)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Restart=on-failure
+          TimeoutStartSec=0
+          ExecStartPre=-/usr/bin/podman rm -f code-server
+          ExecStart=/usr/bin/podman run --name code-server --pull=always \
+            -e PUID={{ puid }} -e PGID={{ pgid }} -e TZ={{ tz }} \
+            -e PASSWORD={{ code_pass }} \
+            -p {{ code_port }}:8443 \
+            -v /srv/code:/config \
+            --replace \
+            ghcr.io/linuxserver/code-server:latest
+          ExecStop=/usr/bin/podman stop code-server
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: Enable + start service
+      systemd:
+        name: code-server
+        state: started
+        enabled: true
+
+    - name: Open firewall port
+      ansible.posix.firewalld:
+        port: "{{ code_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled

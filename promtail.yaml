@@ -1,0 +1,48 @@
+---
+- name: Deploy Promtail Container using Shell (to bypass Collection issues)
+  hosts: all_linux # Targets all hosts in your inventory
+  become: true # Required for Podman install and accessing /var/log as root
+
+  vars:
+    # Set a default role label, but this can be overridden when running the playbook
+    promtail_role: 'general_server' 
+    promtail_config_path: "/etc/promtail/config.yml"
+
+  tasks:
+    - name: Ensure Podman is installed
+      ansible.builtin.package:
+        name: podman
+        state: present
+
+    - name: Ensure /etc/promtail directory exists on remote hosts
+      ansible.builtin.file:
+        path: /etc/promtail
+        state: directory
+        mode: '0755'
+
+    - name: Deploy Promtail configuration file
+      ansible.builtin.template:
+        src: templates/promtail-config.yml.j2
+        dest: "{{ promtail_config_path }}"
+        mode: '0644'
+
+    - name: Stop and remove old Promtail container (if running)
+      ansible.builtin.shell: |
+        podman stop promtail || true
+        podman rm -f promtail || true
+
+    - name: Run Promtail Container
+      ansible.builtin.shell: |
+        podman run -d \
+          --name promtail \
+          --restart always \
+          -v "{{ promtail_config_path }}:/etc/promtail/config.yml:ro" \
+          -v /var/log:/var/log:ro \
+          -v /var/lib/docker/containers:/var/lib/docker/containers:ro \
+          -v /run/log/journal:/run/log/journal:ro \
+          --user root \
+          grafana/promtail:latest \
+          -config.file=/etc/promtail/config.yml
+      args:
+        # Ensures that the shell command is only executed if the file exists on the remote host
+        creates: /etc/promtail/config.yml

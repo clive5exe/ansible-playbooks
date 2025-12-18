@@ -1,0 +1,45 @@
+- name: Base platform for homelab nodes
+  hosts: all
+  become: true
+
+  vars:
+    host_ip_map:
+      r9-ctrl: 192.168.1.30
+      r9-node1: 192.168.1.31
+      r9-node2: 192.168.1.32
+    base_packages:
+      - podman
+      - firewalld
+
+  tasks:
+    - name: Ensure /etc/hosts has lab hostnames
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^{{ item.value }}\s+{{ item.key }}(\s|$)'
+        line: '{{ item.value }} {{ item.key }}'
+        state: present
+      loop: "{{ host_ip_map | dict2items }}"
+
+    - name: Install base packages
+      package:
+        name: "{{ base_packages }}"
+        state: present
+
+    - name: Enable and start firewalld
+      service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Create app data dirs
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /srv/kuma
+        - /srv/ghost
+        - /srv/n8n
+        - /srv/code

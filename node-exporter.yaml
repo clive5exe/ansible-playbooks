@@ -1,0 +1,45 @@
+# node-exporter.yaml
+---
+- name: Run Prometheus node_exporter on all Linux VMs (podman)
+  hosts: all_linux
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install podman on Rocky/RHEL
+      dnf:
+        name: podman
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Install podman on Ubuntu/Debian
+      apt:
+        name: podman
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Stop/remove existing node-exporter container (ignore if missing)
+      shell: |
+        podman rm -f node-exporter 2>/dev/null || true
+      changed_when: false
+
+    - name: Pull node-exporter image
+      shell: |
+        podman pull quay.io/prometheus/node-exporter:latest
+      changed_when: false
+
+    - name: Run node-exporter (host network, SELinux label disabled)
+      shell: |
+        podman run -d --name node-exporter \
+          --restart=unless-stopped \
+          --net=host \
+          --pid=host \
+          --security-opt label=disable \
+          -v /proc:/host/proc:ro \
+          -v /sys:/host/sys:ro \
+          -v /:/rootfs:ro \
+          quay.io/prometheus/node-exporter:latest \
+          --path.procfs=/host/proc \
+          --path.sysfs=/host/sys \
+          --path.rootfs=/rootfs

@@ -1,0 +1,234 @@
+---
+- name: Loki on r9-ctrl + Promtail on all nodes (Systemd units, reboot-safe, no Quadlet dependency)
+  hosts: all_linux
+  become: true
+  gather_facts: true
+
+  vars:
+    loki_host: "192.168.1.30"
+    loki_http_port: 3100
+
+    promtail_image: "docker.io/grafana/promtail:latest"
+    loki_image: "docker.io/grafana/loki:latest"
+
+    promtail_cfg_dir: "/srv/containers/promtail/config"
+    promtail_data_dir: "/srv/containers/promtail/data"
+
+    loki_cfg_dir: "/srv/containers/loki/config"
+    loki_data_dir: "/srv/containers/loki/data"
+
+  tasks:
+    # ---------- PROMTAIL (all nodes) ----------
+    - name: Ensure promtail dirs exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ promtail_cfg_dir }}"
+        - "{{ promtail_data_dir }}"
+
+    - name: Write promtail config (host label = inventory_hostname)
+      copy:
+        dest: "{{ promtail_cfg_dir }}/promtail.yaml"
+        mode: "0644"
+        content: |
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+
+          positions:
+            filename: /var/lib/promtail/positions.yaml
+
+          clients:
+            - url: http://{{ loki_host }}:{{ loki_http_port }}/loki/api/v1/push
+
+          scrape_configs:
+            - job_name: syslog
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: syslog
+                    host: "{{ inventory_hostname }}"
+                    __path__: /var/log/syslog
+
+            - job_name: auth
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: auth
+                    host: "{{ inventory_hostname }}"
+                    __path__: /var/log/auth.log
+
+            - job_name: varlogs
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: varlogs
+                    host: "{{ inventory_hostname }}"
+                    __path__: /var/log/*.log
+
+    - name: Install promtail systemd unit (podman run --replace; SELinux label disabled; no :Z)
+      copy:
+        dest: /etc/systemd/system/promtail.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Promtail (Podman)
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Restart=always
+          RestartSec=2
+          TimeoutStartSec=0
+
+          ExecStartPre=/usr/bin/podman pull {{ promtail_image }}
+          ExecStartPre=/usr/bin/podman rm -f promtail
+
+          ExecStart=/usr/bin/podman run --name promtail --replace \
+            --privileged \
+            --security-opt label=disable \
+            -p 9080:9080 \
+            -v {{ promtail_cfg_dir }}/promtail.yaml:/etc/promtail/config.yaml:ro \
+            -v {{ promtail_data_dir }}:/var/lib/promtail \
+            -v /var/log:/var/log:ro \
+            {{ promtail_image }} \
+            -config.file=/etc/promtail/config.yaml
+
+          ExecStop=/usr/bin/podman stop -t 10 promtail
+          ExecStopPost=/usr/bin/podman rm -f promtail
+
+          [Install]
+          WantedBy=multi-user.target
+
+    # Remove the broken "container-*.service" junk if it exists (poisons systemd output)
+    - name: Remove old generated systemd units that show as BAD (if present)
+      file:
+        path: "/etc/systemd/system/{{ item }}"
+        state: absent
+      loop:
+        - "container-promtail.service"
+        - "container-loki.service"
+      ignore_errors: true
+
+    - name: Disable Quadlet promtail file if present (so it doesn't conflict/confuse)
+      file:
+        path: /etc/containers/systemd/promtail.container
+        state: absent
+      ignore_errors: true
+
+    # ---------- LOKI (r9-ctrl only) ----------
+    - name: Ensure loki dirs exist (r9-ctrl only)
+      when: inventory_hostname == "r9-ctrl"
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ loki_cfg_dir }}"
+        - "{{ loki_data_dir }}"
+
+    - name: Write loki config (r9-ctrl only)
+      when: inventory_hostname == "r9-ctrl"
+      copy:
+        dest: "{{ loki_cfg_dir }}/loki.yaml"
+        mode: "0644"
+        content: |
+          auth_enabled: false
+          server:
+            http_listen_port: {{ loki_http_port }}
+          common:
+            path_prefix: /loki
+            storage:
+              filesystem:
+                chunks_directory: /loki/chunks
+                rules_directory: /loki/rules
+            replication_factor: 1
+            ring:
+              kvstore:
+                store: inmemory
+          schema_config:
+            configs:
+              - from: 2024-01-01
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: index_
+                  period: 24h
+          storage_config:
+            tsdb_shipper:
+              active_index_directory: /loki/index
+              cache_location: /loki/cache
+            filesystem:
+              directory: /loki/chunks
+          limits_config:
+            retention_period: 168h
+          compactor:
+            working_directory: /loki/compactor
+            retention_enabled: true
+            delete_request_store: filesystem
+
+    - name: Install loki systemd unit (r9-ctrl only)
+      when: inventory_hostname == "r9-ctrl"
+      copy:
+        dest: /etc/systemd/system/loki.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Loki (Podman)
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Restart=always
+          RestartSec=2
+          TimeoutStartSec=0
+
+          ExecStartPre=/usr/bin/podman pull {{ loki_image }}
+          ExecStartPre=/usr/bin/podman rm -f loki
+
+          ExecStart=/usr/bin/podman run --name loki --replace \
+            --privileged \
+            --security-opt label=disable \
+            -p {{ loki_http_port }}:{{ loki_http_port }} \
+            -v {{ loki_cfg_dir }}/loki.yaml:/etc/loki/loki.yaml:ro \
+            -v {{ loki_data_dir }}:/loki \
+            {{ loki_image }} \
+            -config.file=/etc/loki/loki.yaml
+
+          ExecStop=/usr/bin/podman stop -t 10 loki
+          ExecStopPost=/usr/bin/podman rm -f loki
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Disable Quadlet loki file if present (r9-ctrl only)
+      when: inventory_hostname == "r9-ctrl"
+      file:
+        path: /etc/containers/systemd/loki.container
+        state: absent
+      ignore_errors: true
+
+    # ---------- APPLY ----------
+    - name: Reload systemd + reset failures
+      shell: |
+        set -e
+        systemctl daemon-reload
+        systemctl reset-failed || true
+      args:
+        executable: /bin/bash
+
+    - name: Enable + start promtail everywhere
+      systemd:
+        name: promtail.service
+        enabled: true
+        state: restarted
+
+    - name: Enable + start loki on r9-ctrl
+      when: inventory_hostname == "r9-ctrl"
+      systemd:
+        name: loki.service
+        enabled: true
+        state: restarted

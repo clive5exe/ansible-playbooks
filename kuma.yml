@@ -1,0 +1,63 @@
+- name: Uptime Kuma on r9-node1
+  hosts: r9-node1
+  become: true
+  vars:
+    kuma_port: 3001
+    kuma_dir: /srv/kuma
+    kuma_unit: /etc/containers/systemd/uptime-kuma.container
+
+  tasks:
+    - name: Ensure data dir exists
+      file:
+        path: "{{ kuma_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install Quadlet unit for Uptime Kuma
+      copy:
+        dest: "{{ kuma_unit }}"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Uptime Kuma (Podman Quadlet)
+
+          [Container]
+          Image=docker.io/louislam/uptime-kuma:1
+          AutoUpdate=registry
+          # :Z = set SELinux label for container access
+          Volume={{ kuma_dir }}:/app/data:Z
+          PublishPort={{ kuma_port }}:3001
+          NoNewPrivileges=true
+          UMask=077
+
+          [Service]
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target default.target
+
+    - name: Reload systemd to pick up unit
+      systemd:
+        daemon_reload: true
+
+    - name: Enable & start Uptime Kuma
+      systemd:
+        name: uptime-kuma
+        enabled: true
+        state: started
+
+    - name: Open firewall port for Kuma
+      ansible.posix.firewalld:
+        port: "{{ kuma_port }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Wait for Kuma to listen
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ kuma_port }}"
+        timeout: 60

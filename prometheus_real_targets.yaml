@@ -1,0 +1,122 @@
+---
+- name: Prometheus - only real VMs, remove server1/server2, file_sd from inventory
+  hosts: r9-ctrl
+  become: true
+  gather_facts: false
+
+  vars:
+    prometheus_config_path: /srv/gitlab/data/prometheus/prometheus.yml
+    file_sd_dir: /srv/gitlab/data/prometheus/file_sd
+    node_sd_file: "{{ file_sd_dir }}/node_exporter_targets.yml"
+    node_exporter_port: 9100
+
+  tasks:
+    - name: Fail if prometheus.yml not found at expected path
+      ansible.builtin.stat:
+        path: "{{ prometheus_config_path }}"
+      register: promcfg
+      failed_when: not promcfg.stat.exists
+
+    - name: Ensure file_sd directory exists
+      ansible.builtin.file:
+        path: "{{ file_sd_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Build file_sd targets from inventory group all_linux
+      ansible.builtin.copy:
+        dest: "{{ node_sd_file }}"
+        mode: "0644"
+        content: |
+          {% for h in (groups['all_linux'] | default([])) %}
+          - targets:
+              - "{{ hostvars[h].ansible_host | default(h) }}:{{ node_exporter_port }}"
+            labels:
+              host: "{{ h }}"
+          {% endfor %}
+
+    # This removes your RHCSA practice junk (server1/server2) no matter where it appears.
+    - name: Remove server1/server2 references from prometheus.yml (if any)
+      ansible.builtin.replace:
+        path: "{{ prometheus_config_path }}"
+        regexp: '.*server[12]\.example\.com.*\n?'
+        replace: ''
+
+    # We manage the node-exporter job as a clean, idempotent block.
+    - name: Ensure node-exporter scrape job uses file_sd (managed block)
+      ansible.builtin.blockinfile:
+        path: "{{ prometheus_config_path }}"
+        marker: "# {mark} ANSIBLE MANAGED NODE-EXPORTER JOB"
+        insertafter: '^scrape_configs:\s*$'
+        block: |
+          - job_name: "node-exporter"
+            file_sd_configs:
+              - files:
+                  - "{{ node_sd_file }}"
+                refresh_interval: 30s
+            relabel_configs:
+              - source_labels: [host]
+                target_label: instance
+
+    - name: Validate prometheus.yml is parseable (basic check via promtool if available)
+      ansible.builtin.shell: |
+        set -e
+        if command -v promtool >/dev/null 2>&1; then
+          promtool check config "{{ prometheus_config_path }}"
+        else
+          echo "promtool not installed, skipping config validation"
+        fi
+      args:
+        executable: /bin/bash
+
+    # Try hot reload first (works only if Prometheus started with --web.enable-lifecycle)
+    - name: Try Prometheus hot reload
+      ansible.builtin.shell: |
+        set -e
+        curl -fsS -X POST http://127.0.0.1:9090/-/reload >/dev/null
+      args:
+        executable: /bin/bash
+      register: reload_result
+      ignore_errors: true
+
+    # If reload fails, restart the container (works for podman-managed Prometheus)
+    - name: Restart Prometheus container if hot reload not available
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        if [ "{{ reload_result.rc | default(1) }}" = "0" ]; then
+          echo "Reload succeeded; no restart needed."
+          exit 0
+        fi
+
+        # Try common service names first
+        if systemctl list-units --all --no-legend | awk '{print $1}' | grep -qx 'prometheus.service'; then
+          systemctl restart prometheus.service
+          exit 0
+        fi
+        if systemctl list-units --all --no-legend | awk '{print $1}' | grep -qx 'container-prometheus.service'; then
+          systemctl restart container-prometheus.service
+          exit 0
+        fi
+
+        # Fall back to podman container restart if a container exists
+        if command -v podman >/dev/null 2>&1; then
+          cname="$(podman ps --format '{{"{{.Names}}"}}' | awk '/^prometheus$/ {print $1}')"
+          if [ -n "${cname:-}" ]; then
+            podman restart prometheus
+            exit 0
+          fi
+        fi
+
+        echo "Could not reload or restart Prometheus automatically (no lifecycle + no known service/container name)."
+        exit 1
+      args:
+        executable: /bin/bash
+
+    - name: Show current node-exporter targets file (sanity)
+      ansible.builtin.shell: |
+        set -e
+        echo "=== {{ node_sd_file }} ==="
+        sed -n '1,200p' "{{ node_sd_file }}"
+      args:
+        executable: /bin/bash

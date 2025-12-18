@@ -1,0 +1,296 @@
+---
+- name: Devbox reset on r9-node2 (Docker + Traefik + code-server + WP + React)
+  hosts: r9-node2
+  become: true
+  vars:
+    code_pw: "november18th"
+    data_root: "/srv/dev"
+  tasks:
+    # Clean conflicts
+    - name: Stop & disable Apache if present
+      ansible.builtin.systemd:
+        name: httpd
+        state: stopped
+        enabled: no
+      ignore_errors: true
+
+    - name: Remove Apache packages if installed
+      ansible.builtin.dnf:
+        name: httpd
+        state: absent
+      ignore_errors: true
+
+    - name: Stop/disable any leftover podman code-server unit
+      ansible.builtin.systemd:
+        name: container-code-server
+        state: stopped
+        enabled: no
+      ignore_errors: true
+
+    - name: Remove leftover podman unit file (if any)
+      ansible.builtin.file:
+        path: /etc/systemd/system/container-code-server.service
+        state: absent
+      ignore_errors: true
+
+    - name: Daemon-reload after unit removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+      ignore_errors: true
+
+    # Baseline + Docker
+    - name: Ensure baseline packages
+      ansible.builtin.dnf:
+        name:
+          - curl
+          - firewalld
+          - dnf-plugins-core
+        state: present
+
+    - name: Enable & start firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Add Docker CE repo
+      ansible.builtin.command:
+        cmd: dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+      args:
+        creates: /etc/yum.repos.d/docker-ce.repo
+
+    - name: Install Docker CE + compose plugin
+      ansible.builtin.dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Enable & start Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # Dirs
+    - name: Create directory tree
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ data_root }}"
+        - "{{ data_root }}/stacks"
+        - "{{ data_root }}/stacks/traefik"
+        - "{{ data_root }}/stacks/code-server"
+        - "{{ data_root }}/stacks/wordpress"
+        - "{{ data_root }}/stacks/react-app"
+        - "{{ data_root }}/traefik"
+        - "{{ data_root }}/data"
+        - "{{ data_root }}/data/code"
+        - "{{ data_root }}/data/mysql/wp1"
+        - "{{ data_root }}/stacks/react-app/build"
+
+    - name: Ensure code-server data owned by uid/gid 1000
+      ansible.builtin.file:
+        path: "{{ data_root }}/data/code"
+        state: directory
+        mode: "0755"
+        owner: 1000
+        group: 1000
+        recurse: yes
+
+    - name: Precreate code-server config dir
+      ansible.builtin.file:
+        path: "{{ data_root }}/data/code/.config/code-server"
+        state: directory
+        mode: "0700"
+        owner: 1000
+        group: 1000
+
+    - name: Seed code-server password
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/data/code/.config/code-server/config.yaml"
+        content: |
+          bind-addr: 0.0.0.0:8443
+          auth: password
+          password: {{ code_pw }}
+        owner: 1000
+        group: 1000
+        mode: "0600"
+
+    # Traefik configs
+    - name: Write Traefik compose
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/stacks/traefik/compose.yml"
+        mode: "0644"
+        content: |
+          services:
+            traefik:
+              image: traefik:v3.1
+              command:
+                - --providers.docker=true
+                - --providers.docker.exposedbydefault=false
+                - --entrypoints.web.address=:80
+              ports:
+                - "80:80"
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock:ro
+                - {{ data_root }}/traefik/traefik.yml:/traefik.yml:ro
+              networks: [web]
+              restart: unless-stopped
+          networks:
+            web:
+              external: true
+
+    - name: Write Traefik static file
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/traefik/traefik.yml"
+        mode: "0644"
+        content: |
+          entryPoints:
+            web:
+              address: ":80"
+          providers:
+            docker:
+              exposedByDefault: false
+
+    # code-server compose
+    - name: Write code-server compose
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/stacks/code-server/compose.yml"
+        mode: "0644"
+        content: |
+          services:
+            code:
+              image: ghcr.io/linuxserver/code-server:latest
+              container_name: code-server
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ=America/New_York
+              volumes:
+                - {{ data_root }}/data/code:/config
+              ports:
+                - "8443:8443"
+              networks: [web]
+              labels:
+                - traefik.enable=true
+                - traefik.http.routers.code.rule=PathPrefix(`/code`)
+                - traefik.http.routers.code.entrypoints=web
+                - traefik.http.routers.code.middlewares=code-strip
+                - traefik.http.middlewares.code-strip.stripprefix.prefixes=/code
+                - traefik.http.services.code.loadbalancer.server.port=8443
+              restart: unless-stopped
+          networks:
+            web:
+              external: true
+
+    # WordPress compose
+    - name: Write WordPress compose
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/stacks/wordpress/compose.yml"
+        mode: "0644"
+        content: |
+          services:
+            db:
+              image: mariadb:11
+              environment:
+                - MYSQL_DATABASE=wp
+                - MYSQL_USER=wp
+                - MYSQL_PASSWORD=secret
+                - MYSQL_ROOT_PASSWORD=supersecret
+              volumes:
+                - {{ data_root }}/data/mysql/wp1:/var/lib/mysql
+              networks: [wpnet]
+              restart: unless-stopped
+
+            wp:
+              image: wordpress:latest
+              depends_on: [db]
+              environment:
+                - WORDPRESS_DB_HOST=db
+                - WORDPRESS_DB_USER=wp
+                - WORDPRESS_DB_PASSWORD=secret
+                - WORDPRESS_DB_NAME=wp
+              networks: [web, wpnet]
+              labels:
+                - traefik.enable=true
+                - traefik.http.routers.wp.rule=PathPrefix(`/wp`)
+                - traefik.http.routers.wp.entrypoints=web
+                - traefik.http.routers.wp.middlewares=wp-strip
+                - traefik.http.middlewares.wp-strip.stripprefix.prefixes=/wp
+                - traefik.http.services.wp.loadbalancer.server.port=80
+              restart: unless-stopped
+
+          networks:
+            web:
+              external: true
+            wpnet:
+
+    # React placeholder compose
+    - name: Write placeholder index.html
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/stacks/react-app/build/index.html"
+        mode: "0644"
+        content: "<h1>Hello from React placeholder</h1>\n"
+
+    - name: Write React compose
+      ansible.builtin.copy:
+        dest: "{{ data_root }}/stacks/react-app/compose.yml"
+        mode: "0644"
+        content: |
+          services:
+            react:
+              image: nginx:alpine
+              volumes:
+                - {{ data_root }}/stacks/react-app/build:/usr/share/nginx/html:ro
+              networks: [web]
+              labels:
+                - traefik.enable=true
+                - traefik.http.routers.react.rule=PathPrefix(`/app`)
+                - traefik.http.routers.react.entrypoints=web
+                - traefik.http.routers.react.middlewares=react-strip
+                - traefik.http.middlewares.react-strip.stripprefix.prefixes=/app
+                - traefik.http.services.react.loadbalancer.server.port=80
+              restart: unless-stopped
+          networks:
+            web:
+              external: true
+
+    # Docker network + firewall
+    - name: Create shared 'web' docker network
+      ansible.builtin.command: docker network create web
+      register: net_out
+      failed_when: false
+      changed_when: "'already exists' not in net_out.stderr | default('')"
+
+    - name: Open ports 80 and 8443
+      ansible.builtin.shell: |
+        firewall-cmd --permanent --add-port=80/tcp || true
+        firewall-cmd --permanent --add-port=8443/tcp || true
+        firewall-cmd --reload || true
+
+    # Bring up stacks (Traefik first)
+    - name: Up traefik
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ data_root }}/stacks/traefik"
+
+    - name: Up code-server
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ data_root }}/stacks/code-server"
+
+    - name: Up WordPress
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ data_root }}/stacks/wordpress"
+
+    - name: Up React
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ data_root }}/stacks/react-app"

@@ -1,0 +1,40 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /var/lib/promtail/positions.yaml
+
+clients:
+  - url: http://192.168.1.30:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: varlogs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          host: "{{ inventory_hostname }}"
+          role: "{{ promtail_role | default('unknown') }}"
+          job: "syslog"
+          __path__: /var/log/*.log
+
+  - job_name: messages
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          host: "{{ inventory_hostname }}"
+          role: "{{ promtail_role | default('unknown') }}"
+          job: "syslog"
+          __path__: /var/log/messages
+
+  - job_name: secure
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          host: "{{ inventory_hostname }}"
+          role: "{{ promtail_role | default('unknown') }}"
+          job: "auth"
+          __path__: /var/log/secure

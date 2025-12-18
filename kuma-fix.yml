@@ -1,0 +1,53 @@
+- hosts: r9-node1
+  become: true
+  tasks:
+    - name: Ensure data dir exists
+      file:
+        path: /srv/kuma
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install Quadlet unit for Uptime Kuma (idempotent)
+      copy:
+        dest: /etc/containers/systemd/uptime-kuma.container
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Uptime Kuma (Podman Quadlet)
+
+          [Container]
+          Image=docker.io/louislam/uptime-kuma:1
+          ContainerName=uptime-kuma
+          Volume=/srv/kuma:/app/data
+          PublishPort=3001:3001
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Ensure podman-quadlet is installed
+      dnf:
+        name: podman-quadlet
+        state: present
+
+    - name: Reload systemd to pick up Quadlet units
+      systemd:
+        daemon_reload: true
+
+    - name: Enable & start Uptime Kuma
+      systemd:
+        name: uptime-kuma.service
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Open firewall port 3001/tcp
+      ansible.posix.firewalld:
+        port: 3001/tcp
+        permanent: true
+        immediate: true
+        state: enabled

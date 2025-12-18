@@ -1,0 +1,81 @@
+# cleanup-login-banner.yaml
+# 1) Seeds controller's known_hosts with current IPs from inventory (no DNS names).
+# 2) Removes any banner scripts and strips figlet/toilet/banner blocks from rc files on targets.
+
+- name: Seed known_hosts on controller with inventory IPs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    scan_targets: "{{ groups['all'] | map('extract', hostvars, 'ansible_host') | list | unique }}"
+    kh_path: "{{ lookup('env','HOME') + '/.ssh/known_hosts' }}"
+  tasks:
+    - name: Ensure ~/.ssh exists
+      ansible.builtin.file:
+        path: "{{ lookup('env','HOME') }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: Ensure known_hosts exists
+      ansible.builtin.file:
+        path: "{{ kh_path }}"
+        state: touch
+        mode: "0600"
+
+    - name: Purge stale keys (by IP)
+      ansible.builtin.shell: |
+        ssh-keygen -R "{{ item }}" >/dev/null 2>&1 || true
+      args:
+        executable: /bin/bash
+      loop: "{{ scan_targets }}"
+      changed_when: false
+
+    - name: Add fresh keys (by IP)
+      ansible.builtin.shell: |
+        ssh-keyscan -T 5 -H "{{ item }}" >> "{{ kh_path }}" 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      loop: "{{ scan_targets }}"
+      changed_when: false
+
+- name: Clean duplicate ASCII login banners everywhere
+  hosts: core
+  become: true
+  gather_facts: false
+  vars:
+    rc_files:
+      - /etc/profile
+      - /etc/bashrc
+      - /root/.bashrc
+      - /root/.bash_profile
+      - /home/ghost/.bashrc
+      - /home/ghost/.bash_profile
+  tasks:
+    - name: Remove any profile.d banner scripts we may have dropped
+      ansible.builtin.find:
+        paths: /etc/profile.d
+        patterns: "*banner*.sh"
+        file_type: file
+      register: banner_scripts
+
+    - name: Delete found banner scripts
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ banner_scripts.files }}"
+      when: banner_scripts.matched | default(0) | int > 0
+
+    - name: Strip figlet/toilet one-liners from rc files
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: '(?m)^\s*(figlet|toilet)\b.*$'
+        replace: ''
+      loop: "{{ rc_files }}"
+      ignore_errors: true
+
+    - name: Strip prior BEGIN/END banner blocks if present
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: '(?s)#\s*BEGIN\s*LOGIN_BANNER.*?#\s*END\s*LOGIN_BANNER\s*'
+        replace: ''
+      loop: "{{ rc_files }}"
+      ignore_errors: true

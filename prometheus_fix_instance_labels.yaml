@@ -1,0 +1,75 @@
+---
+- name: Prometheus - make node exporter instances show hostnames (file_sd labels)
+  hosts: r9-ctrl
+  become: true
+  gather_facts: false
+
+  vars:
+    prom_cfg: /srv/gitlab/data/prometheus/prometheus.yml
+    filesd_dir: /srv/gitlab/data/prometheus/file_sd
+    node_sd_file: /srv/gitlab/data/prometheus/file_sd/node_exporter.yml
+    job_name: node_exporter
+
+  tasks:
+    - name: Fail if prometheus.yml not found
+      ansible.builtin.stat:
+        path: "{{ prom_cfg }}"
+      register: promcfg
+
+    - ansible.builtin.fail:
+        msg: "prometheus.yml not found at {{ prom_cfg }}. Fix prom_cfg in this playbook."
+      when: not promcfg.stat.exists
+
+    - name: Ensure file_sd directory exists
+      ansible.builtin.file:
+        path: "{{ filesd_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write file_sd targets for node exporter (labels set instance/nodename to inventory_hostname)
+      ansible.builtin.copy:
+        dest: "{{ node_sd_file }}"
+        mode: "0644"
+        content: |
+          {% for h in (groups['all_linux'] | default([]) | sort) %}
+          - targets: ["{{ hostvars[h].ansible_host }}:9100"]
+            labels:
+              instance: "{{ h }}"
+              nodename: "{{ h }}"
+              host: "{{ h }}"
+          {% endfor %}
+
+    - name: Ensure node exporter scrape job uses file_sd (managed block)
+      ansible.builtin.blockinfile:
+        path: "{{ prom_cfg }}"
+        marker: "# {mark} ANSIBLE_MANAGED_NODE_EXPORTER"
+        insertafter: '^scrape_configs:'
+        block: |
+          - job_name: '{{ job_name }}'
+            honor_labels: true
+            file_sd_configs:
+              - files:
+                  - '{{ node_sd_file }}'
+                refresh_interval: 30s
+
+    - name: Restart Prometheus (reload endpoint returns 403 in your setup)
+      ansible.builtin.shell: |
+        set -e
+        if command -v podman >/dev/null 2>&1 && podman ps --format '{{"{{"}}.Names{{"}}"}}' | grep -qx prometheus; then
+          podman restart prometheus
+          exit 0
+        fi
+
+        if command -v gitlab-ctl >/dev/null 2>&1; then
+          gitlab-ctl restart prometheus || true
+          exit 0
+        fi
+
+        if systemctl list-units --all | grep -q '^prometheus\.service'; then
+          systemctl restart prometheus
+          exit 0
+        fi
+
+        echo "WARN: Couldn't find how Prometheus is launched here (podman/gitlab-ctl/systemd). Restart it manually."
+      args:
+        executable: /bin/bash
