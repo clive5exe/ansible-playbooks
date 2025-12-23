@@ -1,0 +1,114 @@
+---
+- name: Install and connect Tailscale on all nodes
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    # Where your env file lives on the control box (r9-ctrl) running Ansible
+    ts_env_file: "{{ playbook_dir }}/.env"
+
+  pre_tasks:
+    - name: Load TS_AUTHKEY from local .env (control machine)
+      ansible.builtin.set_fact:
+        ts_authkey: >-
+          {{
+            lookup('ansible.builtin.env', 'TS_AUTHKEY')
+            | default(lookup('ansible.builtin.file', ts_env_file, errors='ignore')
+              | regex_search('(?m)^TS_AUTHKEY\\s*=\\s*(.+)$', '\\1')
+              | default('', true)
+              | regex_replace('^\"|\"$|^\\x27|\\x27$', '')
+            , true)
+          }}
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Fail if no auth key provided
+      ansible.builtin.fail:
+        msg: "Missing Tailscale auth key. Put TS_AUTHKEY=... in {{ ts_env_file }} (on r9-ctrl) or export TS_AUTHKEY in your shell."
+      when: (hostvars['localhost'].ts_authkey | default('') | length) == 0
+      run_once: true
+
+  tasks:
+    # ----------------------------
+    # RHEL / Rocky / Fedora
+    # ----------------------------
+    - name: Install Tailscale on RHEL-family (Rocky/RHEL)
+      when: ansible_os_family == "RedHat"
+      block:
+        - name: Ensure curl/ca-certificates present
+          ansible.builtin.dnf:
+            name:
+              - curl
+              - ca-certificates
+            state: present
+
+        - name: Install Tailscale repo (if missing)
+          ansible.builtin.shell: |
+            set -euo pipefail
+            if [ ! -f /etc/yum.repos.d/tailscale.repo ]; then
+              curl -fsSL https://pkgs.tailscale.com/stable/rhel/9/tailscale.repo -o /etc/yum.repos.d/tailscale.repo
+            fi
+          args:
+            executable: /bin/bash
+
+        - name: Install tailscale package
+          ansible.builtin.dnf:
+            name: tailscale
+            state: present
+            update_cache: true
+
+    # ----------------------------
+    # Ubuntu / Debian
+    # (avoid ansible get_url because your remote python HTTPS stack is broken)
+    # ----------------------------
+    - name: Install Tailscale on Debian-family (Ubuntu/Debian) using curl
+      when: ansible_os_family == "Debian"
+      block:
+        - name: Ensure deps exist
+          ansible.builtin.apt:
+            update_cache: true
+            name:
+              - curl
+              - ca-certificates
+              - gnupg
+            state: present
+
+        - name: Install Tailscale (official script) if not installed
+          ansible.builtin.shell: |
+            set -euo pipefail
+            if command -v tailscale >/dev/null 2>&1; then
+              exit 0
+            fi
+            curl -fsSL https://tailscale.com/install.sh | sh
+          args:
+            executable: /bin/bash
+
+    # ----------------------------
+    # Common: enable + bring up
+    # ----------------------------
+    - name: Enable and start tailscaled
+      ansible.builtin.service:
+        name: tailscaled
+        state: started
+        enabled: true
+
+    - name: Bring node up (idempotent-ish)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if tailscale status >/dev/null 2>&1; then
+          exit 0
+        fi
+        tailscale up --authkey "{{ hostvars['localhost'].ts_authkey }}" --ssh
+      args:
+        executable: /bin/bash
+
+    - name: Show tailscale status
+      ansible.builtin.command: tailscale status
+      register: ts_status
+      changed_when: false
+
+    - name: Print tailscale status
+      ansible.builtin.debug:
+        var: ts_status.stdout
